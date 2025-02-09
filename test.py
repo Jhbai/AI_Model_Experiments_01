@@ -48,7 +48,7 @@ if __name__ == '__main__':
     ]
     
     # 呼叫 consumer_producer.cp_runner 進行整體運算
-    results = consumer_producer.cp_runner(producers, producer_params, consumers, consumer_params)
+    results = consumer_producer.cp_runner_parallel(producers, producer_params, consumers, consumer_params)
     
     # 印出最終結果
     print("最終測試結果：", results)

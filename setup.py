@@ -10,6 +10,7 @@ header_code = r'''\
 #define CONSUMER_PRODUCER_H
 
 #include <Python.h>
+#include <pthread.h>
 
 /*
   cp_run_pair：針對一組 producer 與 consumer 的運算流程
@@ -37,7 +38,7 @@ static inline PyObject* cp_run_pair(PyObject* producer, PyObject* prod_args, PyO
             Py_DECREF(produced);
             return NULL;
         }
-        // 將 produced 放在第一項，注意此處採用偷取引用的方式
+        // 將 produced 放在第一項
         PyTuple_SET_ITEM(new_args, 0, produced);
         for (Py_ssize_t i = 0; i < len; i++) {
             PyObject* item = PyTuple_GET_ITEM(cons_args, i);
@@ -61,6 +62,122 @@ static inline PyObject* cp_run_pair(PyObject* producer, PyObject* prod_args, PyO
     return consumed;
 }
 
+/* ===================== pthread 平行處理部分 ===================== */
+
+/* 定義傳遞給執行緒的參數結構 */
+typedef struct {
+    PyObject* producer;
+    PyObject* prod_args;
+    PyObject* consumer;
+    PyObject* cons_args;
+    PyObject* result;  // consumer 的運算結果
+} cp_pair_args;
+
+/* 執行緒函式，呼叫 cp_run_pair 並儲存結果 */
+static void* cp_run_pair_thread(void* arg) {
+    cp_pair_args* pair = (cp_pair_args*) arg;
+    /* 因為在新執行緒中呼叫 Python API，需要先取得 GIL */
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    pair->result = cp_run_pair(pair->producer, pair->prod_args, pair->consumer, pair->cons_args);
+    PyGILState_Release(gstate);
+    return NULL;
+}
+
+/*
+  cp_run_pairs_parallel：使用 pthread 並行處理多組 producer-consumer 配對
+  輸入：
+    - producers: Python list，每個元素為 producer 函數
+    - producer_params: Python list，每個元素為 producer 的參數 (tuple)
+    - consumers: Python list，每個元素為 consumer 函數
+    - consumer_params: Python list，每個元素為 consumer 的參數 (tuple 或單一物件)
+  回傳：
+    - Python list，包含每一組 consumer 運算結果
+*/
+static PyObject* cp_run_pairs_parallel(PyObject* producers, PyObject* producer_params,
+                                        PyObject* consumers, PyObject* consumer_params) {
+    Py_ssize_t n = PyList_Size(producers);
+    if (PyList_Size(producer_params) != n || PyList_Size(consumers) != n || PyList_Size(consumer_params) != n) {
+        PyErr_SetString(PyExc_ValueError, "所有輸入的 list 長度必須一致");
+        return NULL;
+    }
+    cp_pair_args* args_array = (cp_pair_args*) malloc(n * sizeof(cp_pair_args));
+    if (args_array == NULL) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    pthread_t* threads = (pthread_t*) malloc(n * sizeof(pthread_t));
+    if (threads == NULL) {
+        free(args_array);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        args_array[i].producer = PyList_GetItem(producers, i);
+        args_array[i].prod_args = PyList_GetItem(producer_params, i);
+        args_array[i].consumer = PyList_GetItem(consumers, i);
+        args_array[i].cons_args = PyList_GetItem(consumer_params, i);
+        args_array[i].result = NULL;
+        /* 增加引用計數，因為這些物件將在執行緒中被使用 */
+        Py_INCREF(args_array[i].producer);
+        Py_INCREF(args_array[i].prod_args);
+        Py_INCREF(args_array[i].consumer);
+        Py_INCREF(args_array[i].cons_args);
+    }
+    /* 建立執行緒 */
+    for (Py_ssize_t i = 0; i < n; i++) {
+        int err = pthread_create(&threads[i], NULL, cp_run_pair_thread, (void*) &args_array[i]);
+        if (err != 0) {
+            for (Py_ssize_t j = 0; j < i; j++) {
+                pthread_join(threads[j], NULL);
+            }
+            for (Py_ssize_t j = 0; j < n; j++) {
+                Py_DECREF(args_array[j].producer);
+                Py_DECREF(args_array[j].prod_args);
+                Py_DECREF(args_array[j].consumer);
+                Py_DECREF(args_array[j].cons_args);
+            }
+            free(args_array);
+            free(threads);
+            PyErr_SetString(PyExc_RuntimeError, "無法建立執行緒");
+            return NULL;
+        }
+    }
+    /* 等待所有執行緒結束，並釋放 GIL 讓 worker 執行緒能正常取得 GIL */
+    Py_BEGIN_ALLOW_THREADS;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    Py_END_ALLOW_THREADS;
+    /* 建立結果的 Python list */
+    PyObject* results_list = PyList_New(n);
+    if (results_list == NULL) {
+        for (Py_ssize_t i = 0; i < n; i++) {
+            Py_DECREF(args_array[i].producer);
+            Py_DECREF(args_array[i].prod_args);
+            Py_DECREF(args_array[i].consumer);
+            Py_DECREF(args_array[i].cons_args);
+        }
+        free(args_array);
+        free(threads);
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject* res = args_array[i].result;
+        if (res == NULL) {
+            res = Py_None;
+            Py_INCREF(Py_None);
+        }
+        PyList_SET_ITEM(results_list, i, res);
+        Py_DECREF(args_array[i].producer);
+        Py_DECREF(args_array[i].prod_args);
+        Py_DECREF(args_array[i].consumer);
+        Py_DECREF(args_array[i].cons_args);
+    }
+    free(args_array);
+    free(threads);
+    return results_list;
+}
+
 #endif // CONSUMER_PRODUCER_H
 '''
 
@@ -74,21 +191,17 @@ with open("consumer_producer.h", "w+", encoding="utf-8") as f:
 pyx_code = r'''\
 from cpython.object cimport PyObject
 
+# 引用 C header 檔
 cdef extern from "consumer_producer.h":
     object cp_run_pair(PyObject* producer, PyObject* prod_args, PyObject* consumer, PyObject* cons_args)
+    PyObject* cp_run_pairs_parallel(PyObject* producers, PyObject* producer_params, PyObject* consumers, PyObject* consumer_params)
 
 def cp_runner(list producers, list producer_params, list consumers, list consumer_params):
     """
-    此函式依序執行每一組 producer 與 consumer 的運算流程：
+    此函式依序執行每一組 producer 與 consumer 的運算流程（序列化處理）：
       1. 呼叫 producer(*producer_param) 得到 produced
       2. 呼叫 consumer(produced, *consumer_param) 得到 result
     返回所有 consumer 運算結果組成的 list。
-    
-    參數：
-      - producers：producer 函數的 list
-      - producer_params：對應 producer 的參數 (每個元素預期為 tuple)
-      - consumers：consumer 函數的 list
-      - consumer_params：對應 consumer 的參數 (每個元素預期為 tuple 或單一物件)
     """
     cdef Py_ssize_t n = len(producers)
     if len(producer_params) != n or len(consumers) != n or len(consumer_params) != n:
@@ -106,6 +219,16 @@ def cp_runner(list producers, list producer_params, list consumers, list consume
             raise RuntimeError("運算中發生錯誤")
         outputs.append(result)
     return outputs
+
+def cp_runner_parallel(list producers, list producer_params, list consumers, list consumer_params):
+    """
+    此函式使用 pthread 並行執行每一組 producer 與 consumer 的運算流程，
+    返回所有 consumer 運算結果組成的 list。
+    """
+    return <object>cp_run_pairs_parallel(<PyObject*>producers,
+                                           <PyObject*>producer_params,
+                                           <PyObject*>consumers,
+                                           <PyObject*>consumer_params)
 '''
 
 # 利用 with open 寫入 consumer_producer.pyx
@@ -120,6 +243,7 @@ ext_modules = [
         name="consumer_producer",
         sources=["consumer_producer.pyx"],
         language="c",
+        libraries=["pthread"],  # 連結 pthread 函式庫
     )
 ]
 
